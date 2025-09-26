@@ -1,0 +1,100 @@
+name: Frontend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ develop, main ]
+    paths: [ 'frontend/**', 'k8s/frontend.yaml' ]
+  pull_request:
+    branches: [ main ]
+    paths: [ 'frontend/**' ]
+  workflow_dispatch:
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}.azurecr.io
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # BUILD - Runs on PRs and pushes
+  build:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: |
+          docker build -t frontend:${{ env.IMAGE_TAG }} ./frontend/
+          echo "Frontend image built successfully"
+
+  # PUSH - Only runs on main branch after successful build
+  push:
+    name: Push to ACR
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name ${{ env.ACR_LOGIN_SERVER }}
+
+      - name: Build and Push Frontend Image
+        run: |
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }} ./frontend/
+          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}
+          # Also tag as latest for backward compatibility
+          docker tag ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }} ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+
+      - name: Logout from Azure
+        run: az logout
+        if: always()
+
+  # DEPLOY - Manual trigger or after successful push
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: push
+    environment: Production
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Deploy Frontend
+        run: |
+          echo "Deploying frontend to AKS..."
+          cd k8s/
+          kubectl apply -f frontend.yaml
+
+      - name: Verify Deployment
+        run: |
+          echo "Checking frontend deployment status..."
+          kubectl get pods -l app=frontend
+          kubectl get service frontend-service
+          echo "Frontend deployed successfully!"
+
+      - name: Logout from Azure
+        run: az logout
